@@ -33,7 +33,7 @@ VALID_TYPES: set[str] = {
     "ERR",
 }
 
-MAX_DATA_BYTES: int = 8192
+MAX_DATA_BYTES: int = 65535
 UDP_BUFFER_SIZE: int = 65535
 
 DEFAULT_HOST: str = "127.0.0.1"
@@ -475,6 +475,7 @@ class ChatServerEngine:
                     outgoing.append((peer, err_msg))
                 else:
                     # Broadcast salinan pesan ke SEMUA client aktif kecuali pengirim
+                    # Termasuk pesan [DM:...], [GROUP:...], [FEED], [FEED_COMMENT], Image, dan Voice
                     forward_msg = make_message(
                         msg_type="MSG",
                         seq=seq,

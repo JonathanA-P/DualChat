@@ -394,7 +394,6 @@ class TestBenchmarkSmoke(unittest.TestCase):
                 recv_ready = threading.Event()
 
                 def _receiver_worker() -> None:
-                    recv_ready.set()
                     res = run_benchmark(
                         proto=proto,
                         host="127.0.0.1",
@@ -408,14 +407,15 @@ class TestBenchmarkSmoke(unittest.TestCase):
                         run_id=1,
                         out_dir=tmpdir,
                         receiver_idle_timeout=0.6,
+                        ready_event=recv_ready,
                     )
                     recv_result["summary"] = res
 
                 recv_thread = threading.Thread(target=_receiver_worker, daemon=True)
                 recv_thread.start()
-                recv_ready.wait(timeout=1.0)
-                # Beri waktu singkat agar receiver selesai JOIN sebelum sender mengirim pesan
-                time.sleep(0.15)
+                recv_ready.wait(timeout=3.0)
+                # Berikan jeda sangat kecil agar thread receiver sudah masuk ke recv loop
+                time.sleep(0.05)
 
                 send_summary = run_benchmark(
                     proto=proto,
@@ -562,6 +562,90 @@ class TestWebUiIntegration(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 controller.stop_all()
+
+
+
+class TestPayloadsAndDirectMessageRouting(unittest.TestCase):
+    """Pengujian routing Direct Message ([DM:<user>]) dan payload fitur (Group, Feed, Voice, Image)."""
+
+    def test_direct_message_routing_and_broadcast_payloads(self) -> None:
+        """Uji DM hanya sampai ke target dan broadcast (Group, Feed, Media) sampai ke semua peer."""
+        for proto in ("tcp", "udp"):
+            with self.subTest(proto=proto):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    server = ProtocolServerWorker(proto=proto, host="127.0.0.1", port=0, log_dir=tmpdir)
+                    server.start()
+                    port = server.bound_port
+
+                    c_alice = create_transport(proto)
+                    c_bob = create_transport(proto)
+                    c_charlie = create_transport(proto)
+
+                    try:
+                        # 1. Tiga client JOIN: Alice, Bob, Charlie
+                        c_alice.client_connect("127.0.0.1", port)
+                        c_alice.client_send(make_message("JOIN", 0, "alice", ""))
+                        ack = c_alice.client_recv(timeout=2.0)
+                        self.assertEqual(ack["type"], "ACK_JOIN")
+
+                        c_bob.client_connect("127.0.0.1", port)
+                        c_bob.client_send(make_message("JOIN", 0, "bob", ""))
+                        ack = c_bob.client_recv(timeout=2.0)
+                        self.assertEqual(ack["type"], "ACK_JOIN")
+                        _ = c_alice.client_recv(timeout=2.0)  # flush join notif
+
+                        c_charlie.client_connect("127.0.0.1", port)
+                        c_charlie.client_send(make_message("JOIN", 0, "charlie", ""))
+                        ack = c_charlie.client_recv(timeout=2.0)
+                        self.assertEqual(ack["type"], "ACK_JOIN")
+                        _ = c_alice.client_recv(timeout=2.0)  # flush join notif
+                        _ = c_bob.client_recv(timeout=2.0)  # flush join notif
+
+                        # 2. Alice kirim Direct Message ke Bob: [DM:bob] Halo Bob privat
+                        dm_text = "[DM:bob] Halo Bob privat"
+                        c_alice.client_send(make_message("MSG", 1, "alice", dm_text))
+
+                        # Bob HARUS menerima pesan DM tersebut
+                        msg_bob = c_bob.client_recv(timeout=2.0)
+                        self.assertIsNotNone(msg_bob)
+                        self.assertEqual(msg_bob["user"], "alice")
+                        self.assertEqual(msg_bob["data"], dm_text)
+
+                        # Di broadcast domain, Charlie menerima wire message tapi memfilternya
+                        msg_charlie = c_charlie.client_recv(timeout=2.0)
+                        self.assertIsNotNone(msg_charlie)
+                        self.assertEqual(msg_charlie["data"], dm_text)
+                        # Client filter verifikasi
+                        is_for_charlie = msg_charlie["data"].startswith("[DM:charlie]")
+                        self.assertFalse(is_for_charlie)
+
+                        # 3. Bob kirim pesan Group: [GROUP:Jarkom] Diskusi Kelompok
+                        group_text = "[GROUP:Jarkom] Diskusi Kelompok"
+                        c_bob.client_send(make_message("MSG", 2, "bob", group_text))
+
+                        # Baik Alice maupun Charlie harus menerima broadcast group
+                        g_alice = c_alice.client_recv(timeout=2.0)
+                        g_charlie = c_charlie.client_recv(timeout=2.0)
+                        self.assertEqual(g_alice["data"], group_text)
+                        self.assertEqual(g_charlie["data"], group_text)
+
+                        # 4. Charlie siarkan Feed dan Media (Image & Voice)
+                        feed_text = "[FEED] Pengujian soket selesai dengan sukses"
+                        img_text = "[IMAGE:wireshark:Handshake TCP:🦈:Port 5000 capture]"
+                        voice_text = "[VOICE:5:10,20,30,40,50]"
+
+                        for payload in (feed_text, img_text, voice_text):
+                            c_charlie.client_send(make_message("MSG", 3, "charlie", payload))
+                            m_alice = c_alice.client_recv(timeout=2.0)
+                            m_bob = c_bob.client_recv(timeout=2.0)
+                            self.assertEqual(m_alice["data"], payload)
+                            self.assertEqual(m_bob["data"], payload)
+
+                    finally:
+                        c_alice.close()
+                        c_bob.close()
+                        c_charlie.close()
+                        server.stop()
 
 
 if __name__ == "__main__":

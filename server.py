@@ -254,6 +254,19 @@ def main(argv: list[str] | None = None) -> int:
         print(" DualChat Server Aktif")
         for w in workers:
             print(f" - Mode {w.proto.upper():3s} : {w.host}:{w.bound_port} (Log: {w.csv_logger.filepath})")
+
+        # Deteksi dan tampilkan IP LAN untuk kemudahan koneksi dari HP lain
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+            s.close()
+            print(f" [LAN IP] Untuk koneksi dari HP lain di Wi-Fi:")
+            print(f"          Gunakan Host: {lan_ip}")
+        except Exception:
+            pass
+
         print(" Tekan Ctrl+C untuk menghentikan server dengan rapi.")
         print("========================================================")
 

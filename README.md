@@ -80,6 +80,13 @@ python web_ui.py --ui-port 8080 --tcp-port 5000 --udp-port 5001
 ```
 Lalu buka **`http://127.0.0.1:8080`** di browser Anda. Seluruh aksi di UI menggunakan socket `TcpTransport` (`SOCK_STREAM`) dan `UdpTransport` (`SOCK_DGRAM`) asli di belakang layar sehingga paketnya tetap murni dan siap ditangkap di **Wireshark**.
 
+### 0.1 Menjalankan Native GUI Client Flutter (Windows Desktop & Mobile)
+Selain Web UI, proyek ini kini dilengkapi client native Flutter yang langsung berkomunikasi lewat socket OS murni (`dart:io`):
+```bash
+flutter run -d windows
+```
+Client Flutter ini menyediakan toggle live TCP/UDP, Telemetry HUD (RTT ms, Packets TX/RX, Deteksi Out-of-Order / Packet Loss), chat room, dan tombol `/ping` cepat.
+
 > **Catatan Antar-Perangkat (LAN)**: Secara bawaan, seluruh komponen berjalan di `127.0.0.1` (*localhost*). Saat nanti diuji antar-laptop di jaringan LAN, cukup tambahkan argumen `--host <IP_SERVER>` pada perintah server, client, maupun benchmark **tanpa mengubah satu baris kode pun**.
 
 ### 1. Menjalankan Server (TCP & UDP Bersamaan)

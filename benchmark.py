@@ -96,6 +96,7 @@ def run_benchmark(
     run_id: int = 1,
     out_dir: str | Path = "results",
     receiver_idle_timeout: float = 3.0,
+    ready_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """
     Menjalankan satu sesi benchmark (`ping`, `msg sender`, atau `msg receiver`)
@@ -134,6 +135,9 @@ def run_benchmark(
             )
             if not joined:
                 raise RuntimeError(f"Gagal JOIN ke server {host}:{port} ({proto.upper()})")
+
+            if ready_event is not None:
+                ready_event.set()
 
             t_start = time.time()
 
@@ -214,6 +218,8 @@ def run_benchmark(
                     if interval > 0 and seq < count - 1:
                         time.sleep(interval)
 
+                # Beri jeda singkat agar paket terakhir sempat di-flush oleh buffer socket OS
+                time.sleep(0.04)
                 t_end = time.time()
                 _send_leave_safely(transport, user=user, seq=count)
 
@@ -254,6 +260,8 @@ def run_benchmark(
                     if interval > 0 and seq < count - 1:
                         time.sleep(interval)
 
+                # Beri jeda singkat agar paket terakhir sempat di-flush oleh buffer socket OS
+                time.sleep(0.04)
                 t_end = time.time()
                 _send_leave_safely(transport, user=user, seq=count)
 
@@ -316,6 +324,8 @@ def run_benchmark(
                             "rtt_ms": f"{one_way_ms:.4f}",
                         }
                     )
+                    if count > 0 and recv_count >= count:
+                        break
 
                 # Hitung jumlah pesan yang hilang berdasarkan ekspektasi count
                 unique_received = len(seen_seqs)

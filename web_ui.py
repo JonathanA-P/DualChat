@@ -70,6 +70,12 @@ class ManagedChatClient:
         self.warnings: list[str] = []
         self._expected_seq_by_sender: dict[str, int] = {}
 
+        self.packets_sent: int = 0
+        self.packets_recv: int = 0
+        self.bytes_sent: int = 0
+        self.bytes_recv: int = 0
+        self.out_of_order_count: int = 0
+
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._recv_thread: threading.Thread | None = None
@@ -165,6 +171,16 @@ class ManagedChatClient:
             "wire_preview": wire_preview,
         }
         with self._lock:
+            if direction == "OUT":
+                self.packets_sent += 1
+                self.bytes_sent += wire_size
+            elif direction == "IN":
+                self.packets_recv += 1
+                self.bytes_recv += wire_size
+
+            if warning:
+                self.out_of_order_count += 1
+
             self.messages.append(entry)
             if len(self.messages) > 200:
                 self.messages = self.messages[-200:]
@@ -288,6 +304,11 @@ class ManagedChatClient:
                 "connected": self.connected,
                 "seq": self.seq,
                 "last_rtt_ms": round(self.last_rtt_ms, 3) if self.last_rtt_ms is not None else None,
+                "packets_sent": self.packets_sent,
+                "packets_recv": self.packets_recv,
+                "bytes_sent": self.bytes_sent,
+                "bytes_recv": self.bytes_recv,
+                "out_of_order_count": self.out_of_order_count,
                 "messages": list(self.messages[-50:]),
                 "warnings": list(self.warnings[-10:]),
             }
@@ -333,24 +354,34 @@ class DualChatDashboardController:
         """Menjalankan server TCP dan UDP jika belum aktif."""
         with self._lock:
             if self.tcp_server is None:
-                self.tcp_server = ProtocolServerWorker(
-                    proto="tcp",
-                    host=self.host,
-                    port=self.tcp_port,
-                    log_dir=self.log_dir,
-                )
-                self.tcp_server.start()
-                self.tcp_port = self.tcp_server.bound_port
+                try:
+                    srv = ProtocolServerWorker(
+                        proto="tcp",
+                        host=self.host,
+                        port=self.tcp_port,
+                        log_dir=self.log_dir,
+                    )
+                    srv.start()
+                    self.tcp_server = srv
+                    self.tcp_port = srv.bound_port
+                except OSError as err:
+                    logging.warning("Port TCP %s sudah dipakai (server eksternal berjalan): %s", self.tcp_port, err)
+                    self.tcp_server = None
 
             if self.udp_server is None:
-                self.udp_server = ProtocolServerWorker(
-                    proto="udp",
-                    host=self.host,
-                    port=self.udp_port,
-                    log_dir=self.log_dir,
-                )
-                self.udp_server.start()
-                self.udp_port = self.udp_server.bound_port
+                try:
+                    srv = ProtocolServerWorker(
+                        proto="udp",
+                        host=self.host,
+                        port=self.udp_port,
+                        log_dir=self.log_dir,
+                    )
+                    srv.start()
+                    self.udp_server = srv
+                    self.udp_port = srv.bound_port
+                except OSError as err:
+                    logging.warning("Port UDP %s sudah dipakai (server eksternal berjalan): %s", self.udp_port, err)
+                    self.udp_server = None
 
         return self.get_status()
 
@@ -452,8 +483,11 @@ class DualChatDashboardController:
                 return True, client.to_dict()
             if action == "ping":
                 client.send_ping()
-                # Beri waktu sangat singkat agar PONG di localhost langsung tertangkap
-                time.sleep(0.04)
+                # Tunggu secara dinamis hingga PONG diterima (maks 200ms)
+                for _ in range(20):
+                    time.sleep(0.01)
+                    if client.last_rtt_ms is not None:
+                        break
                 return True, client.to_dict()
             if action == "leave":
                 self.remove_client(client_id)
@@ -702,573 +736,772 @@ class DualChatDashboardController:
 # =====================================================================
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="id" class="dark">
+<html lang="id">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DualChat Network Telemetry & Chat Studio (TCP vs UDP)</title>
+  <title>DualChat Telemetry & Protocol Studio</title>
   <style>
     :root {
-      --bg-main: #0b0f17;
-      --bg-panel: #111827;
-      --bg-card: #1b2436;
-      --bg-input: #0f172a;
-      --border: #2a364f;
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-      --tcp-color: #3b82f6;
-      --tcp-glow: rgba(59, 130, 246, 0.18);
-      --udp-color: #10b981;
-      --udp-glow: rgba(16, 185, 129, 0.18);
-      --warn-color: #f59e0b;
-      --err-color: #ef4444;
-      --accent-purple: #8b5cf6;
+      --bg-main: #0B0F19;
+      --bg-sidebar: #0F172A;
+      --bg-card: #1E293B;
+      --bg-subtle: #131B2E;
+      --border-color: rgba(255, 255, 255, 0.08);
+      --tcp-color: #10B981;
+      --tcp-glow: rgba(16, 185, 129, 0.18);
+      --udp-color: #F59E0B;
+      --udp-glow: rgba(245, 158, 11, 0.18);
+      --text-main: #FFFFFF;
+      --text-muted: #94A3B8;
+      --text-dim: #64748B;
+      --cyan-accent: #38BDF8;
+      --err-color: #EF4444;
+      --err-bg: #2E1313;
+      --pong-bg: #0F291E;
+      --pong-border: rgba(16, 185, 129, 0.35);
+      --pong-text: #34D399;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background-color: var(--bg-main);
       color: var(--text-main);
-      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-      font-size: 14px;
-      line-height: 1.5;
-      min-height: 100vh;
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+      font-size: 13px;
+      line-height: 1.4;
+      height: 100vh;
+      overflow: hidden;
       display: flex;
       flex-direction: column;
     }
-    /* Top Navbar */
-    .topbar {
-      background: var(--bg-panel);
-      border-bottom: 1px solid var(--border);
-      padding: 12px 24px;
+
+    /* TOPBAR (FLUTTER APPBAR REPLICA) */
+    .appbar {
+      background: var(--bg-sidebar);
+      height: 52px;
+      padding: 0 16px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 12px;
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
     }
-    .brand {
+    .appbar-left {
       display: flex;
       align-items: center;
       gap: 12px;
     }
-    .brand-logo {
-      width: 38px;
-      height: 38px;
-      border-radius: 10px;
-      background: linear-gradient(135deg, var(--tcp-color), var(--udp-color));
+    .proto-badge {
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 1.2px;
+      transition: all 0.2s;
+    }
+    .proto-badge.tcp {
+      background: var(--tcp-glow);
+      color: var(--tcp-color);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .proto-badge.udp {
+      background: var(--udp-glow);
+      color: var(--udp-color);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }
+    .appbar-title {
+      font-size: 17px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .status-tag {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.06);
+      font-family: Consolas, monospace;
+    }
+    .status-tag.connected { color: #10B981; }
+    .status-tag.connecting { color: #F59E0B; }
+    .status-tag.disconnected { color: #64748B; }
+
+    .appbar-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .icon-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      width: 34px;
+      height: 34px;
+      border-radius: 6px;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-weight: 800;
-      font-size: 16px;
+      cursor: pointer;
+      font-size: 15px;
+      transition: all 0.15s;
+    }
+    .icon-btn:hover {
+      background: rgba(255, 255, 255, 0.08);
       color: #fff;
-      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
     }
-    .brand-title h1 {
-      font-size: 17px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-    }
-    .brand-title p {
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .status-pills {
+    .icon-btn.ping-btn { color: var(--cyan-accent); }
+    .icon-btn.ping-btn:hover { background: rgba(56, 189, 248, 0.15); }
+
+    /* VIEW SWITCHER TABS */
+    .view-tabs {
+      background: var(--bg-sidebar);
       display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-      border: 1px solid var(--border);
-      background: var(--bg-card);
-    }
-    .pill.tcp { border-color: rgba(59,130,246,0.45); background: var(--tcp-glow); color: #93c5fd; }
-    .pill.udp { border-color: rgba(16,185,129,0.45); background: var(--udp-glow); color: #6ee7b7; }
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #22c55e;
-      box-shadow: 0 0 8px #22c55e;
-    }
-    /* Navigation Tabs */
-    .nav-tabs {
-      display: flex;
-      gap: 6px;
-      background: var(--bg-panel);
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border);
+      gap: 2px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
       overflow-x: auto;
     }
-    .tab-btn {
+    .vtab-btn {
       background: transparent;
-      color: var(--text-muted);
       border: none;
       border-bottom: 2px solid transparent;
-      padding: 12px 18px;
-      font-size: 13px;
+      color: var(--text-muted);
+      padding: 8px 14px;
+      font-size: 12px;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.15s;
       white-space: nowrap;
     }
-    .tab-btn:hover { color: var(--text-main); }
-    .tab-btn.active {
+    .vtab-btn:hover { color: #fff; }
+    .vtab-btn.active {
       color: #fff;
       border-bottom-color: var(--tcp-color);
-      background: rgba(59, 130, 246, 0.08);
+      background: rgba(255, 255, 255, 0.03);
     }
-    /* Main Workspace Container */
-    .workspace {
+    .vtab-btn.active.udp-mode { border-bottom-color: var(--udp-color); }
+
+    /* WORKSPACE BODY */
+    .workspace-body {
       flex: 1;
-      padding: 20px 24px;
-      max-width: 1500px;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+    .view-panel {
+      display: none;
       width: 100%;
-      margin: 0 auto;
+      height: 100%;
     }
-    .tab-pane { display: none; }
-    .tab-pane.active { display: block; }
-    /* Grid helpers */
-    .split-2 {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
+    .view-panel.active { display: flex; }
+
+    /* ======================================================== */
+    /* FLUTTER CLIENT LAYOUT                                    */
+    /* ======================================================== */
+    .flutter-layout {
+      width: 100%;
+      height: 100%;
+      display: flex;
     }
-    @media (max-width: 1024px) {
-      .split-2 { grid-template-columns: 1fr; }
-    }
-    .card {
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 18px;
+
+    /* SIDEBAR */
+    .flutter-sidebar {
+      width: 320px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-color);
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      padding: 16px;
+      overflow-y: auto;
+      flex-shrink: 0;
+      gap: 12px;
     }
-    .card.tcp-card { border-top: 3px solid var(--tcp-color); }
-    .card.udp-card { border-top: 3px solid var(--udp-color); }
-    .card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid var(--border);
-    }
-    .card-title {
-      font-size: 15px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .badge {
+    .sidebar-section {
       font-size: 11px;
-      padding: 2px 8px;
-      border-radius: 6px;
       font-weight: 700;
+      color: var(--text-dim);
+      letter-spacing: 1.1px;
       text-transform: uppercase;
     }
-    .badge-tcp { background: var(--tcp-glow); color: #60a5fa; border: 1px solid rgba(59,130,246,0.4); }
-    .badge-udp { background: var(--udp-glow); color: #34d399; border: 1px solid rgba(16,185,129,0.4); }
-    .proto-specs {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      background: var(--bg-input);
-      padding: 10px;
+
+    /* Proto Segmented Button */
+    .proto-toggle {
+      background: var(--bg-card);
       border-radius: 8px;
-      border: 1px solid var(--border);
-      font-size: 12px;
-    }
-    .spec-item span { display: block; color: var(--text-muted); font-size: 11px; }
-    .spec-item strong { color: var(--text-main); font-family: Consolas, monospace; }
-    /* Forms & Buttons */
-    .form-row {
+      padding: 4px;
       display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
+      gap: 4px;
     }
-    input[type="text"], input[type="number"], select {
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      color: var(--text-main);
-      padding: 8px 12px;
-      border-radius: 8px;
-      font-size: 13px;
-      outline: none;
-    }
-    input:focus, select:focus { border-color: var(--tcp-color); }
-    .btn {
-      padding: 8px 14px;
-      border-radius: 8px;
-      border: 1px solid transparent;
-      font-size: 13px;
-      font-weight: 600;
+    .proto-opt {
+      flex: 1;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 8px 0;
+      border-radius: 6px;
       cursor: pointer;
       transition: all 0.15s;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
+      text-align: center;
     }
-    .btn-tcp { background: var(--tcp-color); color: #fff; }
-    .btn-tcp:hover { background: #2563eb; }
-    .btn-udp { background: var(--udp-color); color: #052e16; font-weight: 700; }
-    .btn-udp:hover { background: #059669; color: #fff; }
-    .btn-secondary {
-      background: var(--bg-card);
-      color: var(--text-main);
-      border-color: var(--border);
-    }
-    .btn-secondary:hover { background: #26334d; }
-    .btn-danger {
-      background: rgba(239, 68, 68, 0.15);
-      color: #fca5a5;
-      border-color: rgba(239, 68, 68, 0.35);
-    }
-    .btn-danger:hover { background: #ef4444; color: #fff; }
-    /* Client pills selector */
-    .client-list {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      min-height: 34px;
-      align-items: center;
-    }
-    .client-chip {
-      padding: 5px 11px;
-      border-radius: 8px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      font-size: 12px;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .client-chip.active-tcp {
-      border-color: var(--tcp-color);
+    .proto-opt.active.tcp {
       background: var(--tcp-glow);
-      color: #fff;
-      font-weight: 600;
+      color: var(--tcp-color);
+      font-weight: 700;
+      border: 1px solid rgba(16, 185, 129, 0.4);
     }
-    .client-chip.active-udp {
-      border-color: var(--udp-color);
+    .proto-opt.active.udp {
       background: var(--udp-glow);
-      color: #fff;
-      font-weight: 600;
+      color: var(--udp-color);
+      font-weight: 700;
+      border: 1px solid rgba(245, 158, 11, 0.4);
     }
-    /* Chat Feed */
-    .chat-box {
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      height: 310px;
-      overflow-y: auto;
-      padding: 12px;
+
+    .form-group {
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      font-size: 13px;
+      gap: 5px;
     }
-    .chat-msg {
-      padding: 8px 11px;
-      border-radius: 8px;
-      background: var(--bg-card);
-      border-left: 3px solid var(--border);
-    }
-    .chat-msg.out { border-left-color: var(--tcp-color); background: rgba(59, 130, 246, 0.08); }
-    .chat-msg.in { border-left-color: var(--udp-color); }
-    .chat-msg.pong { border-left-color: var(--accent-purple); background: rgba(139, 92, 246, 0.1); }
-    .chat-msg.warn { border-left-color: var(--warn-color); background: rgba(245, 158, 11, 0.12); }
-    .msg-meta {
-      display: flex;
-      justify-content: space-between;
-      font-size: 11px;
+    .form-group label {
+      font-size: 12px;
       color: var(--text-muted);
-      margin-bottom: 3px;
+    }
+    .flutter-input {
+      background: var(--bg-card);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      color: #fff;
+      padding: 8px 12px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .flutter-input:focus { border-color: var(--cyan-accent); }
+
+    .btn-connect {
+      width: 100%;
+      height: 40px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #fff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.15s;
+      margin-top: 4px;
+    }
+    .btn-connect.tcp { background: var(--tcp-color); }
+    .btn-connect.tcp:hover { background: #059669; }
+    .btn-connect.udp { background: var(--udp-color); color: #000; font-weight: 800; }
+    .btn-connect.udp:hover { background: #d97706; color: #fff; }
+    .btn-connect.disconnect { background: var(--err-color); color: #fff; }
+    .btn-connect.disconnect:hover { background: #dc2626; }
+
+    /* HUD METRIC GRID */
+    .hud-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .hud-card {
+      background: var(--bg-card);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 6px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+    }
+    .hud-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-dim);
+    }
+    .hud-val {
+      font-size: 14px;
+      font-weight: 700;
+      margin-top: 3px;
       font-family: Consolas, monospace;
     }
-    .wire-tag {
-      margin-top: 4px;
-      padding: 4px 7px;
-      background: rgba(0,0,0,0.35);
+
+    .framing-note {
+      background: var(--bg-subtle);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 6px;
+      padding: 10px;
+      font-size: 11px;
+      margin-top: auto;
+    }
+    .framing-note-header {
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 4px;
+      color: #fff;
+    }
+    .framing-note-body {
+      color: var(--text-muted);
+      font-size: 10.5px;
+      line-height: 1.35;
+    }
+
+    /* MAIN CHAT CANVAS */
+    .flutter-chat {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-main);
+      overflow: hidden;
+    }
+    .chat-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .empty-chat {
+      margin: auto;
+      text-align: center;
+      color: var(--text-dim);
+    }
+    .empty-chat .empty-icon {
+      font-size: 42px;
+      opacity: 0.25;
+      margin-bottom: 8px;
+    }
+
+    /* Chat message row */
+    .msg-row {
+      display: flex;
+      flex-direction: column;
+      max-width: 580px;
+    }
+    .msg-row.self {
+      align-self: flex-end;
+      align-items: flex-end;
+    }
+    .msg-row.peer {
+      align-self: flex-start;
+      align-items: flex-start;
+    }
+    .msg-meta-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 3px;
+      font-size: 11px;
+    }
+    .msg-user { font-weight: 700; }
+    .msg-user.self.tcp { color: var(--tcp-color); }
+    .msg-user.self.udp { color: var(--udp-color); }
+    .msg-user.peer { color: var(--cyan-accent); }
+    .seq-chip {
+      background: rgba(255, 255, 255, 0.08);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: Consolas, monospace;
+      color: var(--text-dim);
+    }
+
+    .msg-bubble {
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13.5px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .msg-bubble.self.tcp {
+      background: rgba(16, 185, 129, 0.16);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      border-bottom-right-radius: 2px;
+      color: #fff;
+    }
+    .msg-bubble.self.udp {
+      background: rgba(245, 158, 11, 0.16);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      border-bottom-right-radius: 2px;
+      color: #fff;
+    }
+    .msg-bubble.peer {
+      background: var(--bg-card);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-bottom-left-radius: 2px;
+      color: #fff;
+    }
+
+    .pong-card {
+      align-self: flex-start;
+      background: var(--pong-bg);
+      border: 1px solid var(--pong-border);
+      color: var(--pong-text);
+      padding: 7px 12px;
+      border-radius: 8px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .warn-chip {
+      background: rgba(239, 68, 68, 0.16);
+      border: 1px solid var(--err-color);
+      color: #FCA5A5;
+      padding: 4px 8px;
       border-radius: 4px;
       font-family: Consolas, monospace;
       font-size: 11px;
-      color: #94a3b8;
-      word-break: break-all;
+      margin-bottom: 4px;
     }
-    /* Benchmark metrics & charts */
-    .metric-grid {
+    .sys-card {
+      align-self: center;
+      background: var(--bg-subtle);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-family: Consolas, monospace;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      max-width: 90%;
+      text-align: center;
+    }
+    .sys-card.err {
+      background: var(--err-bg);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #FCA5A5;
+    }
+
+    /* CHAT INPUT BAR */
+    .flutter-input-bar {
+      background: var(--bg-sidebar);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-top: 1px solid var(--border-color);
+      flex-shrink: 0;
+    }
+    .ping-icon-btn {
+      background: transparent;
+      border: none;
+      color: var(--udp-color);
+      width: 38px;
+      height: 38px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s;
+    }
+    .ping-icon-btn:hover { background: rgba(245, 158, 11, 0.15); }
+    .chat-text-input {
+      flex: 1;
+      background: var(--bg-card);
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #fff;
+      font-size: 13.5px;
+      outline: none;
+    }
+    .send-icon-btn {
+      width: 38px;
+      height: 38px;
+      border-radius: 8px;
+      border: none;
+      background: var(--tcp-color);
+      color: #fff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      transition: all 0.15s;
+    }
+    .send-icon-btn.udp { background: var(--udp-color); color: #000; }
+    .send-icon-btn:disabled { background: #334155; color: #64748B; cursor: not-allowed; }
+
+    /* ======================================================== */
+    /* OTHER TABS (BENCHMARK, FRAMING, CSV)                      */
+    /* ======================================================== */
+    .standard-panel {
+      padding: 20px 24px;
+      width: 100%;
+      height: 100%;
+      overflow-y: auto;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    .card {
+      background: var(--bg-sidebar);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .split-2 {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
     }
     @media (max-width: 900px) {
-      .metric-grid { grid-template-columns: repeat(2, 1fr); }
+      .split-2 { grid-template-columns: 1fr; }
+      .flutter-layout { flex-direction: column; }
+      .flutter-sidebar { width: 100%; height: auto; }
     }
-    .metric-box {
+    .btn-action {
       background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 12px;
+      border: 1px solid var(--border-color);
+      color: #fff;
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
     }
-    .metric-box .label { font-size: 12px; color: var(--text-muted); }
-    .metric-box .val { font-size: 20px; font-weight: 700; margin-top: 4px; font-family: Consolas, monospace; }
-    canvas.chart-canvas {
-      width: 100%;
-      height: 250px;
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-    }
-    /* Tables */
+    .btn-action:hover { background: #26334d; }
+    .btn-action.primary { background: var(--tcp-color); border-color: transparent; }
     .table-wrap {
       overflow-x: auto;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-      text-align: left;
-    }
-    th, td {
-      padding: 9px 12px;
-      border-bottom: 1px solid var(--border);
-      font-family: Consolas, monospace;
-    }
-    th { background: var(--bg-card); color: var(--text-muted); font-weight: 600; }
-    tr:hover td { background: rgba(255,255,255,0.02); }
-    .code-block {
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      padding: 12px;
+      border: 1px solid var(--border-color);
       border-radius: 8px;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 8px 12px; border-bottom: 1px solid var(--border-color); font-family: Consolas, monospace; }
+    th { background: var(--bg-card); color: var(--text-muted); font-weight: 600; text-align: left; }
+    .code-box {
+      background: var(--bg-card);
+      padding: 12px;
+      border-radius: 6px;
       font-family: Consolas, monospace;
       font-size: 12px;
-      overflow-x: auto;
-      color: #e2e8f0;
+      color: #E2E8F0;
+      white-space: pre-wrap;
+      word-break: break-all;
     }
-    .toast {
+
+    /* MODAL */
+    .modal-overlay {
       position: fixed;
-      bottom: 20px;
-      right: 20px;
-      background: #1e293b;
-      border: 1px solid var(--tcp-color);
-      color: #fff;
-      padding: 10px 16px;
-      border-radius: 10px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.45);
-      font-size: 13px;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.75);
       display: none;
-      z-index: 999;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal-box {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      max-width: 550px;
+      width: 90%;
+      padding: 20px;
+    }
+    .modal-header {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: #fff;
+    }
+    .modal-body {
+      font-size: 12.5px;
+      line-height: 1.5;
+      color: #CBD5E1;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 16px;
     }
   </style>
 </head>
 <body>
 
-  <!-- TOP TELEMETRY NAVBAR -->
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-logo">DC</div>
-      <div class="brand-title">
-        <h1>DualChat Telemetry & Protocol Studio</h1>
-        <p>Perbandingan Apple-to-Apple TCP (SOCK_STREAM) vs UDP (SOCK_DGRAM) pada Application Layer</p>
-      </div>
+  <!-- APPBAR (FLUTTER STYLE) -->
+  <header class="appbar">
+    <div class="appbar-left">
+      <span id="hdr-proto-pill" class="proto-badge tcp">TCP</span>
+      <span class="appbar-title">DualChat Telemetry & Protocol Studio</span>
+      <span id="hdr-status-tag" class="status-tag disconnected">DISCONNECTED</span>
     </div>
-    <div class="status-pills">
-      <div class="pill tcp">
-        <span class="dot"></span>
-        <span>TCP Server: <strong id="nav-tcp-port">127.0.0.1:5000</strong> (<span id="nav-tcp-users">0</span> client)</span>
-      </div>
-      <div class="pill udp">
-        <span class="dot"></span>
-        <span>UDP Server: <strong id="nav-udp-port">127.0.0.1:5001</strong> (<span id="nav-udp-users">0</span> client)</span>
-      </div>
+    <div class="appbar-right">
+      <button class="icon-btn ping-btn" title="Send PING (/ping)" onclick="handleSendPing()">⚡</button>
+      <button class="icon-btn" title="Clear Chat Log" onclick="clearChatLog()">🗑</button>
+      <button class="icon-btn" title="Wire Protocol Info" onclick="openModal()">ℹ️</button>
     </div>
   </header>
 
-  <!-- WORKSPACE TABS -->
-  <nav class="nav-tabs">
-    <button class="tab-btn active" onclick="switchTab('tab-chat', this)">💬 1. Dual-Protocol Chat Arena (TCP vs UDP)</button>
-    <button class="tab-btn" onclick="switchTab('tab-bench', this)">⚡ 2. Benchmark Lab & Grafik RTT/Throughput</button>
-    <button class="tab-btn" onclick="switchTab('tab-framing', this)">🔍 3. Wire Framing Visualizer & Server Log</button>
-    <button class="tab-btn" onclick="switchTab('tab-csv', this)">📁 4. CSV Explorer (Bahan Laporan)</button>
+  <!-- NAVIGATION TABS -->
+  <nav class="view-tabs">
+    <button class="vtab-btn active" onclick="switchView('tab-flutter', this)">💬 Client Studio (Flutter UI)</button>
+    <button class="vtab-btn" onclick="switchView('tab-bench', this)">⚡ Benchmark Lab & Grafik RTT</button>
+    <button class="vtab-btn" onclick="switchView('tab-framing', this)">🔍 Wire Framing Visualizer</button>
+    <button class="vtab-btn" onclick="switchView('tab-csv', this)">📁 CSV Explorer</button>
   </nav>
 
-  <!-- MAIN CONTENT -->
-  <main class="workspace">
+  <!-- WORKSPACE BODY -->
+  <div class="workspace-body">
 
-    <!-- ========================================================= -->
-    <!-- TAB 1: DUAL-PROTOCOL INTERACTIVE CHAT ARENA               -->
-    <!-- ========================================================= -->
-    <section id="tab-chat" class="tab-pane active">
-      <div class="split-2">
+    <!-- VIEW 1: FLUTTER CLIENT INTERFACE -->
+    <div id="tab-flutter" class="view-panel active">
+      <div class="flutter-layout">
+        
+        <!-- SIDEBAR -->
+        <aside class="flutter-sidebar">
+          <div class="sidebar-section">NETWORK CONFIGURATION</div>
 
-        <!-- TCP ROOM PANEL -->
-        <div class="card tcp-card">
-          <div class="card-header">
-            <div class="card-title">
-              <span class="badge badge-tcp">TCP · SOCK_STREAM</span>
-              <span>Connection-Oriented Chat Room</span>
+          <!-- Protocol Tabs -->
+          <div class="proto-toggle">
+            <button id="opt-tcp" class="proto-opt active tcp" onclick="selectProto('tcp')">TCP (Stream)</button>
+            <button id="opt-udp" class="proto-opt" onclick="selectProto('udp')">UDP (Datagram)</button>
+          </div>
+
+          <!-- Inputs -->
+          <div class="form-group">
+            <label>Server Host / IP</label>
+            <input type="text" id="cfg-host" class="flutter-input" value="127.0.0.1" />
+          </div>
+
+          <div class="form-group">
+            <label>Port</label>
+            <input type="number" id="cfg-port" class="flutter-input" value="5000" />
+          </div>
+
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" id="cfg-user" class="flutter-input" value="alice" />
+          </div>
+
+          <button id="btn-toggle-connect" class="btn-connect tcp" onclick="toggleConnect()">
+            <span id="btn-connect-icon">🔗</span>
+            <span id="btn-connect-label">CONNECT & JOIN</span>
+          </button>
+
+          <div class="sidebar-section" style="margin-top: 14px;">LIVE TELEMETRY HUD</div>
+          <div class="hud-grid">
+            <div class="hud-card">
+              <span class="hud-label">Packets TX</span>
+              <span id="hud-tx-pkts" class="hud-val" style="color:#38BDF8;">0</span>
             </div>
-            <button class="btn btn-secondary" onclick="quickSeedClients('tcp')" title="Buat 2 client contoh otomatis">⚡ Quick Demo (alice_tcp & bob_tcp)</button>
-          </div>
-
-          <div class="proto-specs">
-            <div class="spec-item"><span>Handshake</span><strong>3-Way (SYN/SYN-ACK/ACK)</strong></div>
-            <div class="spec-item"><span>Framing</span><strong>Byte Stream + '\n' Buffer</strong></div>
-            <div class="spec-item"><span>Header Overhead</span><strong>20+ Byte per Segmen</strong></div>
-          </div>
-
-          <div class="form-row">
-            <input type="text" id="tcp-new-user" placeholder="Username baru (mis. alice)" style="flex:1" />
-            <button class="btn btn-tcp" onclick="joinClient('tcp')">+ JOIN TCP</button>
-          </div>
-
-          <div>
-            <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">Pilih Client TCP Aktif (Pengirim/Penampil):</div>
-            <div id="tcp-client-list" class="client-list">
-              <span style="color:var(--text-muted); font-size:12px;">Belum ada client TCP. Klik "+ JOIN TCP" atau "Quick Demo".</span>
+            <div class="hud-card">
+              <span class="hud-label">Packets RX</span>
+              <span id="hud-rx-pkts" class="hud-val" style="color:#818CF8;">0</span>
             </div>
-          </div>
-
-          <div id="tcp-chat-box" class="chat-box"></div>
-
-          <div class="form-row">
-            <input type="text" id="tcp-msg-input" placeholder="Ketik pesan MSG untuk dikirim lewat stream TCP..." style="flex:1" onkeydown="if(event.key==='Enter') sendChatMsg('tcp')" />
-            <button class="btn btn-tcp" onclick="sendChatMsg('tcp')">Kirim MSG</button>
-            <button class="btn btn-secondary" onclick="sendPing('tcp')">📡 /ping (RTT)</button>
-            <button class="btn btn-danger" onclick="leaveCurrentClient('tcp')">/quit</button>
-          </div>
-        </div>
-
-        <!-- UDP ROOM PANEL -->
-        <div class="card udp-card">
-          <div class="card-header">
-            <div class="card-title">
-              <span class="badge badge-udp">UDP · SOCK_DGRAM</span>
-              <span>Connectionless Datagram Room</span>
+            <div class="hud-card">
+              <span class="hud-label">RTT Terakhir</span>
+              <span id="hud-rtt" class="hud-val" style="color:#10B981;">—</span>
             </div>
-            <button class="btn btn-secondary" onclick="quickSeedClients('udp')" title="Buat 2 client contoh otomatis">⚡ Quick Demo (alice_udp & bob_udp)</button>
-          </div>
-
-          <div class="proto-specs">
-            <div class="spec-item"><span>Handshake</span><strong>Tanpa Handshake (0 RTT)</strong></div>
-            <div class="spec-item"><span>Framing</span><strong>1 Datagram = 1 Pesan</strong></div>
-            <div class="spec-item"><span>Reliability</span><strong>No Retry / Seq Gap Check</strong></div>
-          </div>
-
-          <div class="form-row">
-            <input type="text" id="udp-new-user" placeholder="Username baru (mis. charlie)" style="flex:1" />
-            <button class="btn btn-udp" onclick="joinClient('udp')">+ JOIN UDP</button>
-          </div>
-
-          <div>
-            <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">Pilih Client UDP Aktif (Pengirim/Penampil):</div>
-            <div id="udp-client-list" class="client-list">
-              <span style="color:var(--text-muted); font-size:12px;">Belum ada client UDP. Klik "+ JOIN UDP" atau "Quick Demo".</span>
+            <div class="hud-card">
+              <span class="hud-label">Out-of-Order / Loss</span>
+              <span id="hud-ooo" class="hud-val" style="color:#64748B;">0</span>
+            </div>
+            <div class="hud-card">
+              <span class="hud-label">Bytes TX</span>
+              <span id="hud-tx-bytes" class="hud-val" style="color:#94A3B8;">0 B</span>
+            </div>
+            <div class="hud-card">
+              <span class="hud-label">Bytes RX</span>
+              <span id="hud-rx-bytes" class="hud-val" style="color:#94A3B8;">0 B</span>
             </div>
           </div>
 
-          <div id="udp-chat-box" class="chat-box"></div>
-
-          <div class="form-row">
-            <input type="text" id="udp-msg-input" placeholder="Ketik pesan MSG untuk dikirim sebagai datagram UDP..." style="flex:1" onkeydown="if(event.key==='Enter') sendChatMsg('udp')" />
-            <button class="btn btn-udp" onclick="sendChatMsg('udp')">Kirim MSG</button>
-            <button class="btn btn-secondary" onclick="sendPing('udp')">📡 /ping (RTT)</button>
-            <button class="btn btn-danger" onclick="leaveCurrentClient('udp')">/quit</button>
+          <div class="framing-note">
+            <div class="framing-note-header">
+              <span id="fn-icon">🌐</span>
+              <span id="fn-title">TCP Framing (Stream)</span>
+            </div>
+            <div id="fn-desc" class="framing-note-body">
+              Byte-stream kontinu dengan delimiter \n (0x0A). Menggunakan framing buffer StreamFramer.
+            </div>
           </div>
-        </div>
+        </aside>
+
+        <!-- MAIN CHAT CANVAS -->
+        <main class="flutter-chat">
+          <div id="chat-feed" class="chat-scroll">
+            <div id="empty-hint" class="empty-chat">
+              <div class="empty-icon">💬</div>
+              <div style="font-size:14px; color:var(--text-muted);">Belum ada pesan chat.</div>
+              <div style="font-size:12px; margin-top:4px;">Hubungkan client lalu kirim pesan atau /ping untuk menguji.</div>
+            </div>
+          </div>
+
+          <div class="flutter-input-bar">
+            <button class="ping-icon-btn" title="Quick /ping" onclick="handleSendPing()">⚡</button>
+            <input type="text" id="chat-input" class="chat-text-input" placeholder="Ketik pesan chat atau /ping..." onkeydown="if(event.key==='Enter') handleSendChat()" disabled />
+            <button id="btn-send-chat" class="send-icon-btn" onclick="handleSendChat()" disabled>→</button>
+          </div>
+        </main>
 
       </div>
-    </section>
+    </div>
 
-    <!-- ========================================================= -->
-    <!-- TAB 2: BENCHMARK LAB & GRAFIK PERBANDINGAN                -->
-    <!-- ========================================================= -->
-    <section id="tab-bench" class="tab-pane">
-      <div class="card" style="margin-bottom: 20px;">
-        <div class="card-header">
-          <div class="card-title">⚡ Konfigurasi Workload Benchmark Deterministik (`benchmark.py`)</div>
-          <span style="font-size:12px; color:var(--text-muted)">Payload: <code>'x' * size</code> | Menghasilkan CSV otomatis di <code>results/</code></span>
-        </div>
-
-        <div class="form-row" style="gap: 14px;">
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Protokol</label>
-            <select id="bm-proto">
-              <option value="both" selected>Head-to-Head (TCP & UDP Sekaligus)</option>
-              <option value="tcp">Hanya TCP</option>
-              <option value="udp">Hanya UDP</option>
-            </select>
-          </div>
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Mode Uji</label>
-            <select id="bm-mode">
-              <option value="ping" selected>Mode PING (Ukur RTT & Jitter)</option>
-              <option value="msg">Mode MSG (Sender -> Receiver Throughput)</option>
-            </select>
-          </div>
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Jumlah Pesan (--count)</label>
-            <input type="number" id="bm-count" value="50" min="5" max="2000" style="width:110px" />
-          </div>
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Ukuran Data (--size B)</label>
-            <input type="number" id="bm-size" value="128" min="1" max="8192" style="width:110px" />
-          </div>
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Interval (--interval s)</label>
-            <input type="number" id="bm-interval" value="0.002" step="0.001" min="0" style="width:110px" />
-          </div>
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Label Skenario</label>
-            <input type="text" id="bm-scenario" value="S1" style="width:80px" />
-          </div>
-          <div>
-            <label style="display:block; font-size:11px; color:var(--text-muted)">Run #</label>
-            <input type="number" id="bm-run" value="1" min="1" style="width:70px" />
-          </div>
-          <div style="margin-top: 16px;">
-            <button id="btn-run-bm" class="btn btn-tcp" onclick="triggerBenchmark()">▶ Jalankan Benchmark</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="split-2" style="margin-bottom: 20px;">
+    <!-- VIEW 2: BENCHMARK LAB -->
+    <div id="tab-bench" class="view-panel">
+      <div class="standard-panel">
         <div class="card">
-          <div class="card-header">
-            <div class="card-title">📈 Grafik Perbandingan Latensi / RTT per Sequence (`seq`)</div>
-            <span style="font-size:12px; color:var(--text-muted)">Biru = TCP | Hijau = UDP</span>
+          <div class="card-title">⚡ Workload Benchmark Deterministik</div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+            <div>
+              <label style="font-size:11px; color:var(--text-dim); display:block;">Protokol</label>
+              <select id="bm-proto" class="flutter-input" style="padding:6px 10px;">
+                <option value="both" selected>Head-to-Head (TCP & UDP)</option>
+                <option value="tcp">TCP Saja</option>
+                <option value="udp">UDP Saja</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:11px; color:var(--text-dim); display:block;">Mode</label>
+              <select id="bm-mode" class="flutter-input" style="padding:6px 10px;">
+                <option value="ping" selected>Mode PING (RTT)</option>
+                <option value="msg">Mode MSG (Throughput)</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:11px; color:var(--text-dim); display:block;">Pesan (--count)</label>
+              <input type="number" id="bm-count" class="flutter-input" value="50" style="width:90px;" />
+            </div>
+            <div>
+              <label style="font-size:11px; color:var(--text-dim); display:block;">Ukuran Byte (--size)</label>
+              <input type="number" id="bm-size" class="flutter-input" value="128" style="width:90px;" />
+            </div>
+            <div>
+              <label style="font-size:11px; color:var(--text-dim); display:block;">Interval s</label>
+              <input type="number" id="bm-interval" class="flutter-input" value="0.002" step="0.001" style="width:90px;" />
+            </div>
+            <div>
+              <label style="font-size:11px; color:var(--text-dim); display:block;">Skenario</label>
+              <input type="text" id="bm-scenario" class="flutter-input" value="S1" style="width:80px;" />
+            </div>
+            <button id="btn-run-bm" class="btn-action primary" onclick="triggerBenchmark()" style="margin-top:16px;">▶ Jalankan Benchmark</button>
           </div>
-          <canvas id="rttChart" class="chart-canvas" width="650" height="250"></canvas>
         </div>
 
         <div class="card">
-          <div class="card-header">
-            <div class="card-title">📊 Perbandingan Throughput & Keandalan Pengiriman</div>
-            <span style="font-size:12px; color:var(--text-muted)">Hasil Run Terakhir</span>
-          </div>
-          <div id="bm-summary-cards" class="metric-grid">
-            <div class="metric-box"><div class="label">TCP Avg RTT</div><div class="val" id="m-tcp-rtt">-</div></div>
-            <div class="metric-box"><div class="label">UDP Avg RTT</div><div class="val" id="m-udp-rtt">-</div></div>
-            <div class="metric-box"><div class="label">TCP Throughput</div><div class="val" id="m-tcp-tp">-</div></div>
-            <div class="metric-box"><div class="label">UDP Throughput</div><div class="val" id="m-udp-tp">-</div></div>
-          </div>
+          <div class="card-title">📊 Hasil Pengujian Terakhir</div>
           <div class="table-wrap">
             <table>
               <thead>
@@ -1280,121 +1513,144 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                   <th>Lost</th>
                   <th>OOO</th>
                   <th>RTT Avg (ms)</th>
-                  <th>StdDev</th>
                   <th>Throughput (B/s)</th>
                 </tr>
               </thead>
-              <tbody id="bm-results-tbody">
-                <tr><td colspan="9" style="text-align:center; color:var(--text-muted)">Klik "Jalankan Benchmark" untuk melihat perbandingan statistik.</td></tr>
+              <tbody id="bm-tbody">
+                <tr><td colspan="8" style="text-align:center; color:var(--text-dim);">Belum ada benchmark dijalankan.</td></tr>
               </tbody>
             </table>
           </div>
         </div>
       </div>
-    </section>
+    </div>
 
-    <!-- ========================================================= -->
-    <!-- TAB 3: WIRE FRAMING VISUALIZER & LIVE SERVER LOG          -->
-    <!-- ========================================================= -->
-    <section id="tab-framing" class="tab-pane">
-      <div class="split-2">
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">🔬 Simulator Framing: TCP Byte-Stream (`\n`) vs UDP Datagram</div>
+    <!-- VIEW 3: FRAMING SIMULATOR -->
+    <div id="tab-framing" class="view-panel">
+      <div class="standard-panel">
+        <div class="split-2">
+          <div class="card">
+            <div class="card-title">🔬 Simulator Framing TCP vs UDP</div>
+            <p style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">
+              Lihat bagaimana satu pesan JSON di-frame di kawat. TCP memotong stream dan memakai delimiter \n, sedangkan UDP utuh dalam 1 datagram.
+            </p>
+            <div style="display:flex; flex-direction:column; gap:10px;">
+              <input type="text" id="sim-text" class="flutter-input" value="Halo semua! Ini uji framing TCP vs UDP." />
+              <div style="display:flex; gap:10px; align-items:center;">
+                <label style="font-size:12px; color:var(--text-dim);">Potong chunk TCP di byte:</label>
+                <input type="number" id="sim-split" class="flutter-input" value="25" style="width:70px;" />
+                <button class="btn-action primary" onclick="runFramingSim()">Simulasikan</button>
+              </div>
+              <div id="sim-output" class="code-box">Klik "Simulasikan" untuk melihat representasi byte.</div>
+            </div>
           </div>
-          <p style="font-size:12px; color:var(--text-muted)">
-            Uji bagaimana satu pesan JSON diperlakukan berbeda di Transport Layer: TCP menambahkan delimiter <code>\n</code> dan merakit potongan chunk menggunakan <code>StreamFramer</code>, sedangkan UDP mengirimkannya sebagai 1 datagram utuh.
-          </p>
-          <div class="form-row">
-            <input type="text" id="sim-text" value="Halo semua! Ini uji framing TCP vs UDP." style="flex:1" />
-            <label style="font-size:12px; color:var(--text-muted)">Potong Chunk TCP di byte ke-:</label>
-            <input type="number" id="sim-split" value="28" min="5" max="120" style="width:75px" />
-            <button class="btn btn-tcp" onclick="runFramingSim()">Simulasikan</button>
-          </div>
-          <div id="sim-output" class="code-block">Klik "Simulasikan" untuk melihat representasi byte di kawat (wire format).</div>
-        </div>
 
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">📡 Live Server CSV Telemetry (`server_tcp.csv` & `server_udp.csv`)</div>
-            <button class="btn btn-secondary" onclick="refreshServerLogs()">↻ Refresh Log</button>
-          </div>
-          <div class="table-wrap" style="max-height: 360px; overflow-y: auto;">
-            <table>
-              <thead>
-                <tr>
-                  <th>Proto</th>
-                  <th>Event</th>
-                  <th>Type</th>
-                  <th>Seq</th>
-                  <th>User</th>
-                  <th>Bytes</th>
-                  <th>Peer</th>
-                </tr>
-              </thead>
-              <tbody id="server-log-tbody"></tbody>
-            </table>
+          <div class="card">
+            <div class="card-title">
+              <span>📡 Live Server Event Log</span>
+              <button class="btn-action" onclick="refreshServerLogs()">↻ Refresh</button>
+            </div>
+            <div class="table-wrap" style="max-height: 380px;">
+              <table>
+                <thead>
+                  <tr><th>Proto</th><th>Event</th><th>Type</th><th>Seq</th><th>User</th><th>Bytes</th></tr>
+                </thead>
+                <tbody id="server-log-tbody"></tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
-    </section>
+    </div>
 
-    <!-- ========================================================= -->
-    <!-- TAB 4: CSV EXPLORER (HASIL EKSPERIMEN)                    -->
-    <!-- ========================================================= -->
-    <section id="tab-csv" class="tab-pane">
-      <div class="split-2">
-        <div class="card" style="max-width: 420px;">
-          <div class="card-header">
-            <div class="card-title">📁 Daftar File CSV di <code>results/</code></div>
-            <button class="btn btn-secondary" onclick="pollStatus()">↻ Refresh</button>
+    <!-- VIEW 4: CSV EXPLORER -->
+    <div id="tab-csv" class="view-panel">
+      <div class="standard-panel">
+        <div class="split-2">
+          <div class="card" style="max-width:380px;">
+            <div class="card-title">
+              <span>📁 File CSV di results/</span>
+              <button class="btn-action" onclick="pollStatus()">↻</button>
+            </div>
+            <div id="csv-file-list" style="display:flex; flex-direction:column; gap:6px;"></div>
           </div>
-          <div id="csv-file-list" style="display:flex; flex-direction:column; gap:8px;"></div>
-        </div>
 
-        <div class="card" style="flex:1;">
-          <div class="card-header">
-            <div class="card-title">📄 Pratinjau Isi CSV: <span id="csv-preview-title" style="color:var(--tcp-color)">Pilih file</span></div>
-            <a id="csv-download-link" class="btn btn-secondary" href="#" download style="display:none; text-decoration:none;">⬇ Download CSV</a>
-          </div>
-          <div class="table-wrap" style="max-height: 440px; overflow-y: auto;">
-            <table id="csv-preview-table">
-              <thead><tr><th>Pilih salah satu file CSV di panel kiri untuk melihat datanya.</th></tr></thead>
-              <tbody></tbody>
-            </table>
+          <div class="card">
+            <div class="card-title">
+              <span id="csv-preview-title">Pilih file CSV</span>
+              <a id="csv-download-link" class="btn-action" href="#" download style="display:none; text-decoration:none;">⬇ Download</a>
+            </div>
+            <div class="table-wrap" style="max-height:450px;">
+              <table id="csv-preview-table">
+                <thead><tr><th>Pilih file CSV di sisi kiri.</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
-    </section>
+    </div>
 
-  </main>
+  </div>
 
-  <div id="toast" class="toast"></div>
+  <!-- PROTOCOL INFO MODAL -->
+  <div id="info-modal" class="modal-overlay" onclick="closeModal(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-header">Spesifikasi Protokol DualChat</div>
+      <div class="modal-body">
+        <p><strong>1. TCP (SOCK_STREAM):</strong><br>
+        - Berorientasi byte-stream (tidak ada batasan pesan bawaan).<br>
+        - Menggunakan delimiter <code>\n</code> (0x0A) dan buffer framing <code>StreamFramer</code>.<br>
+        - Handshake 3-way (SYN &rarr; SYN-ACK &rarr; ACK) saat inisialisasi socket.<br>
+        - Pengurutan & retransmisi otomatis di level kernel OS.<br><br>
+        <strong>2. UDP (SOCK_DGRAM):</strong><br>
+        - Berbasis datagram utuh (1 sendto = 1 recvfrom).<br>
+        - Connectionless (tanpa handshake).<br>
+        - Tidak ada retransmisi atau pengurutan ulang di aplikasi, sehingga paket loss / out-of-order terlihat apa adanya.<br><br>
+        <strong>3. Format Pesan (JSON UTF-8):</strong><br>
+        <code>{"type": "...", "seq": int, "ts": float, "user": "...", "data": "..."}</code></p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-action primary" onclick="closeModal()">Tutup</button>
+      </div>
+    </div>
+  </div>
 
   <script>
-    let state = {
-      clients: [],
-      selectedClient: { tcp: null, udp: null },
-      lastBenchResults: []
+    const appState = {
+      proto: 'tcp',
+      connected: false,
+      clientId: null,
+      username: 'alice',
+      pollTimer: null,
+      displayedMsgCount: 0
     };
 
-    function showToast(msg) {
-      const el = document.getElementById('toast');
-      el.textContent = msg;
-      el.style.display = 'block';
-      clearTimeout(window._toastTimer);
-      window._toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3000);
-    }
+    function selectProto(proto) {
+      if (appState.connected) return;
+      appState.proto = proto;
+      const isTcp = proto === 'tcp';
 
-    function switchTab(tabId, btn) {
-      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.getElementById(tabId).classList.add('active');
-      btn.classList.add('active');
-      if (tabId === 'tab-framing') {
-        runFramingSim();
-        refreshServerLogs();
-      }
+      document.getElementById('opt-tcp').className = 'proto-opt' + (isTcp ? ' active tcp' : '');
+      document.getElementById('opt-udp').className = 'proto-opt' + (!isTcp ? ' active udp' : '');
+
+      const pill = document.getElementById('hdr-proto-pill');
+      pill.textContent = proto.toUpperCase();
+      pill.className = 'proto-badge ' + proto;
+
+      const btn = document.getElementById('btn-toggle-connect');
+      btn.className = 'btn-connect ' + proto;
+
+      const sendBtn = document.getElementById('btn-send-chat');
+      sendBtn.className = 'send-icon-btn ' + proto;
+
+      document.getElementById('cfg-port').value = isTcp ? '5000' : '5001';
+
+      document.getElementById('fn-icon').textContent = isTcp ? '🌐' : '📡';
+      document.getElementById('fn-title').textContent = isTcp ? 'TCP Framing (Stream)' : 'UDP Framing (Datagram)';
+      document.getElementById('fn-desc').textContent = isTcp
+        ? 'Byte-stream kontinu dengan delimiter \\n (0x0A). Menggunakan framing buffer StreamFramer.'
+        : '1 Datagram = 1 Pesan utuh via sendto(). Connectionless tanpa retransmisi.';
     }
 
     async function api(path, method = 'GET', body = null) {
@@ -1406,142 +1662,267 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       return data;
     }
 
-    async function pollStatus() {
-      try {
-        const data = await api('/api/status');
-        document.getElementById('nav-tcp-port').textContent = `${data.host}:${data.tcp_server.port}`;
-        document.getElementById('nav-tcp-users').textContent = data.tcp_server.active_users.length;
-        document.getElementById('nav-udp-port').textContent = `${data.host}:${data.udp_server.port}`;
-        document.getElementById('nav-udp-users').textContent = data.udp_server.active_users.length;
+    async function toggleConnect() {
+      if (appState.connected) {
+        // Disconnect
+        try {
+          await api('/api/clients/action', 'POST', { client_id: appState.clientId, action: 'leave' });
+        } catch (_) {}
+        setDisconnected();
+      } else {
+        // Connect & Join
+        const host = document.getElementById('cfg-host').value.trim() || '127.0.0.1';
+        const port = parseInt(document.getElementById('cfg-port').value.trim(), 10) || 5000;
+        const user = document.getElementById('cfg-user').value.trim();
+        if (!user) {
+          alert('Username tidak boleh kosong!');
+          return;
+        }
 
-        state.clients = data.clients || [];
-        renderClients('tcp');
-        renderClients('udp');
-        renderCsvFileList(data.csv_files || []);
-      } catch (e) {
-        console.error(e);
+        appState.username = user;
+        setConnecting();
+
+        try {
+          const res = await api('/api/clients/join', 'POST', {
+            proto: appState.proto,
+            user: user,
+            host: host,
+            port: port
+          });
+
+          appState.clientId = res.client.client_id;
+          setConnected();
+          renderMessages(res.client.messages || []);
+          updateHud(res.client);
+        } catch (err) {
+          setDisconnected();
+          appendSystemMessage('Gagal terhubung: ' + err.message, true);
+        }
       }
     }
 
-    function renderClients(proto) {
-      const listEl = document.getElementById(`${proto}-client-list`);
-      const boxEl = document.getElementById(`${proto}-chat-box`);
-      const protoClients = state.clients.filter(c => c.proto === proto && c.connected);
+    function setConnected() {
+      appState.connected = true;
+      document.getElementById('hdr-status-tag').textContent = 'CONNECTED';
+      document.getElementById('hdr-status-tag').className = 'status-tag connected';
 
-      if (protoClients.length === 0) {
-        state.selectedClient[proto] = null;
-        listEl.innerHTML = `<span style="color:var(--text-muted); font-size:12px;">Belum ada client ${proto.toUpperCase()} aktif.</span>`;
-        boxEl.innerHTML = `<div style="color:var(--text-muted); text-align:center; margin-top:110px;">Tambahkan client ${proto.toUpperCase()} (JOIN) untuk mulai mengirim pesan dan menguji /ping.</div>`;
+      const btn = document.getElementById('btn-toggle-connect');
+      btn.className = 'btn-connect disconnect';
+      document.getElementById('btn-connect-icon').textContent = '❌';
+      document.getElementById('btn-connect-label').textContent = 'DISCONNECT';
+
+      document.getElementById('chat-input').disabled = false;
+      document.getElementById('btn-send-chat').disabled = false;
+      document.getElementById('cfg-host').disabled = true;
+      document.getElementById('cfg-port').disabled = true;
+      document.getElementById('cfg-user').disabled = true;
+
+      startPolling();
+    }
+
+    function setConnecting() {
+      document.getElementById('hdr-status-tag').textContent = 'CONNECTING...';
+      document.getElementById('hdr-status-tag').className = 'status-tag connecting';
+      document.getElementById('btn-connect-label').textContent = 'CONNECTING...';
+    }
+
+    function setDisconnected() {
+      appState.connected = false;
+      appState.clientId = null;
+      document.getElementById('hdr-status-tag').textContent = 'DISCONNECTED';
+      document.getElementById('hdr-status-tag').className = 'status-tag disconnected';
+
+      const btn = document.getElementById('btn-toggle-connect');
+      btn.className = 'btn-connect ' + appState.proto;
+      document.getElementById('btn-connect-icon').textContent = '🔗';
+      document.getElementById('btn-connect-label').textContent = 'CONNECT & JOIN';
+
+      document.getElementById('chat-input').disabled = true;
+      document.getElementById('btn-send-chat').disabled = true;
+      document.getElementById('cfg-host').disabled = false;
+      document.getElementById('cfg-port').disabled = false;
+      document.getElementById('cfg-user').disabled = false;
+
+      stopPolling();
+    }
+
+    function startPolling() {
+      stopPolling();
+      appState.pollTimer = setInterval(pollClientUpdates, 350);
+    }
+
+    function stopPolling() {
+      if (appState.pollTimer) {
+        clearInterval(appState.pollTimer);
+        appState.pollTimer = null;
+      }
+    }
+
+    async function pollClientUpdates() {
+      if (!appState.connected || !appState.clientId) return;
+      try {
+        const data = await api('/api/status');
+        const clients = data.clients || [];
+        const client = clients.find(c => c.client_id === appState.clientId);
+        if (client) {
+          if (!client.connected) {
+            setDisconnected();
+            appendSystemMessage('Koneksi terputus dari server', true);
+            return;
+          }
+          renderMessages(client.messages || []);
+          updateHud(client);
+        }
+      } catch (_) {}
+    }
+
+    function updateHud(client) {
+      document.getElementById('hud-tx-pkts').textContent = client.packets_sent || 0;
+      document.getElementById('hud-rx-pkts').textContent = client.packets_recv || 0;
+      document.getElementById('hud-rtt').textContent = client.last_rtt_ms !== null ? client.last_rtt_ms + ' ms' : '—';
+      const ooo = client.out_of_order_count || 0;
+      const oooEl = document.getElementById('hud-ooo');
+      oooEl.textContent = ooo;
+      oooEl.style.color = ooo > 0 ? '#EF4444' : '#64748B';
+      document.getElementById('hud-tx-bytes').textContent = formatBytes(client.bytes_sent || 0);
+      document.getElementById('hud-rx-bytes').textContent = formatBytes(client.bytes_recv || 0);
+    }
+
+    function formatBytes(b) {
+      if (b < 1024) return b + ' B';
+      return (b / 1024).toFixed(1) + ' KB';
+    }
+
+    function renderMessages(messages) {
+      const feed = document.getElementById('chat-feed');
+      const empty = document.getElementById('empty-hint');
+      if (!messages || messages.length === 0) {
+        if (empty) empty.style.display = 'block';
+        return;
+      }
+      if (empty) empty.style.display = 'none';
+
+      feed.innerHTML = messages.map(m => {
+        if (m.type === 'PONG') {
+          return `
+            <div class="pong-card">
+              <span>⚡</span>
+              <span>[PONG] seq=${m.seq} RTT = ${m.rtt_ms !== null ? m.rtt_ms : '—'} ms</span>
+            </div>
+          `;
+        }
+        if (m.type === 'ACK_JOIN' || m.sender === 'server' || m.type === 'ERR') {
+          const isErr = m.type === 'ERR';
+          return `
+            <div class="sys-card ${isErr ? 'err' : ''}">
+              <span>${isErr ? '❌' : 'ℹ️'}</span> ${escapeHtml(m.data || m.type)}
+            </div>
+          `;
+        }
+
+        const isSelf = m.sender === appState.username || m.direction === 'OUT';
+        const warnHtml = m.warning ? `<div class="warn-chip">⚠️ ${escapeHtml(m.warning)}</div>` : '';
+
+        return `
+          <div class="msg-row ${isSelf ? 'self' : 'peer'}">
+            ${warnHtml}
+            <div class="msg-meta-row">
+              <span class="msg-user ${isSelf ? 'self ' + appState.proto : 'peer'}">
+                ${isSelf ? 'You (' + escapeHtml(m.sender) + ')' : escapeHtml(m.sender)}
+              </span>
+              <span class="seq-chip">seq: ${m.seq}</span>
+            </div>
+            <div class="msg-bubble ${isSelf ? 'self ' + appState.proto : 'peer'}">
+              ${escapeHtml(m.data)}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    function appendSystemMessage(text, isErr = false) {
+      const feed = document.getElementById('chat-feed');
+      const empty = document.getElementById('empty-hint');
+      if (empty) empty.style.display = 'none';
+
+      const div = document.createElement('div');
+      div.className = 'sys-card' + (isErr ? ' err' : '');
+      div.innerHTML = `<span>${isErr ? '❌' : 'ℹ️'}</span> ${escapeHtml(text)}`;
+      feed.appendChild(div);
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    async function handleSendChat() {
+      if (!appState.connected || !appState.clientId) return;
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      if (text === '/ping') {
+        handleSendPing();
+        input.value = '';
         return;
       }
 
-      if (!state.selectedClient[proto] || !protoClients.some(c => c.client_id === state.selectedClient[proto])) {
-        state.selectedClient[proto] = protoClients[0].client_id;
-      }
-
-      listEl.innerHTML = protoClients.map(c => {
-        const isSel = c.client_id === state.selectedClient[proto];
-        const cls = isSel ? `client-chip active-${proto}` : 'client-chip';
-        const rttBadge = c.last_rtt_ms !== null ? `<span style="opacity:0.85">(${c.last_rtt_ms} ms)</span>` : '';
-        return `<div class="${cls}" onclick="selectClient('${proto}', '${c.client_id}')">
-          <span>👤 ${c.user} [seq=${c.seq}]</span> ${rttBadge}
-        </div>`;
-      }).join('');
-
-      const activeObj = protoClients.find(c => c.client_id === state.selectedClient[proto]);
-      if (!activeObj) return;
-
-      boxEl.innerHTML = activeObj.messages.map(m => {
-        let cls = 'chat-msg ' + (m.direction === 'OUT' ? 'out' : 'in');
-        if (m.type === 'PONG') cls = 'chat-msg pong';
-        if (m.warning) cls = 'chat-msg warn';
-        const warnHtml = m.warning ? `<div style="color:#fbbf24; font-weight:700; font-size:12px; margin-top:4px;">⚠️ [PERINGATAN] ${m.warning}</div>` : '';
-        return `<div class="${cls}">
-          <div class="msg-meta">
-            <span><strong>[${m.sender}]</strong> · ${m.type} · seq=${m.seq}</span>
-            <span>${m.wire_size} B (${m.proto.toUpperCase()})</span>
-          </div>
-          <div>${escapeHtml(m.data)}</div>
-          ${warnHtml}
-          <div class="wire-tag">Wire: ${escapeHtml(m.wire_preview)}</div>
-        </div>`;
-      }).join('');
-      boxEl.scrollTop = boxEl.scrollHeight;
-    }
-
-    function selectClient(proto, clientId) {
-      state.selectedClient[proto] = clientId;
-      renderClients(proto);
-    }
-
-    async function joinClient(proto, customUser = null) {
-      const input = document.getElementById(`${proto}-new-user`);
-      const user = (customUser || input.value).trim();
-      if (!user) return showToast('Masukkan username terlebih dahulu!');
       try {
-        const res = await api('/api/clients/join', 'POST', { proto, user });
-        if (!customUser) input.value = '';
-        state.selectedClient[proto] = res.client.client_id;
-        showToast(`JOIN ${proto.toUpperCase()} berhasil sebagai '${user}'`);
-        await pollStatus();
-      } catch (e) {
-        showToast(`Gagal JOIN: ${e.message}`);
-      }
-    }
-
-    async function quickSeedClients(proto) {
-      const u1 = `alice_${proto}`;
-      const u2 = `bob_${proto}`;
-      await joinClient(proto, u1);
-      await joinClient(proto, u2);
-      state.selectedClient[proto] = `${proto}_${u1}`;
-      await pollStatus();
-    }
-
-    async function sendChatMsg(proto) {
-      const cid = state.selectedClient[proto];
-      if (!cid) return showToast(`Pilih atau JOIN client ${proto.toUpperCase()} terlebih dahulu`);
-      const input = document.getElementById(`${proto}-msg-input`);
-      const text = input.value.trim();
-      if (!text) return;
-      try {
-        await api('/api/clients/action', 'POST', { client_id: cid, action: 'msg', text });
+        await api('/api/clients/action', 'POST', {
+          client_id: appState.clientId,
+          action: 'msg',
+          text: text
+        });
         input.value = '';
-        await pollStatus();
-      } catch (e) {
-        showToast(e.message);
+        pollClientUpdates();
+      } catch (err) {
+        appendSystemMessage(err.message, true);
       }
     }
 
-    async function sendPing(proto) {
-      const cid = state.selectedClient[proto];
-      if (!cid) return showToast(`Pilih atau JOIN client ${proto.toUpperCase()} terlebih dahulu`);
+    async function handleSendPing() {
+      if (!appState.connected || !appState.clientId) {
+        alert('Hubungkan client terlebih dahulu!');
+        return;
+      }
       try {
-        const res = await api('/api/clients/action', 'POST', { client_id: cid, action: 'ping' });
-        const rtt = res.client.last_rtt_ms;
-        showToast(rtt !== null ? `PONG diterima (${proto.toUpperCase()}): RTT = ${rtt} ms` : `PING dikirim (${proto.toUpperCase()})`);
-        await pollStatus();
-      } catch (e) {
-        showToast(e.message);
+        await api('/api/clients/action', 'POST', {
+          client_id: appState.clientId,
+          action: 'ping'
+        });
+        pollClientUpdates();
+      } catch (err) {
+        appendSystemMessage(err.message, true);
       }
     }
 
-    async function leaveCurrentClient(proto) {
-      const cid = state.selectedClient[proto];
-      if (!cid) return;
-      try {
-        await api('/api/clients/action', 'POST', { client_id: cid, action: 'leave' });
-        showToast(`Client ${cid} keluar (LEAVE)`);
-        await pollStatus();
-      } catch (e) {
-        showToast(e.message);
+    function clearChatLog() {
+      const feed = document.getElementById('chat-feed');
+      feed.innerHTML = `
+        <div id="empty-hint" class="empty-chat">
+          <div class="empty-icon">💬</div>
+          <div style="font-size:14px; color:var(--text-muted);">Chat log dibersihkan.</div>
+        </div>
+      `;
+    }
+
+    function switchView(viewId, btn) {
+      document.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.vtab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById(viewId).classList.add('active');
+      btn.classList.add('active');
+
+      if (viewId === 'tab-framing') {
+        runFramingSim();
+        refreshServerLogs();
+      } else if (viewId === 'tab-csv') {
+        pollStatus();
       }
     }
 
     async function triggerBenchmark() {
       const btn = document.getElementById('btn-run-bm');
       btn.disabled = true;
-      btn.textContent = '⏳ Menjalankan Benchmark...';
+      btn.textContent = '⏳ Menjalankan...';
       try {
         const payload = {
           proto: document.getElementById('bm-proto').value,
@@ -1550,172 +1931,92 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           size: parseInt(document.getElementById('bm-size').value, 10),
           interval: parseFloat(document.getElementById('bm-interval').value),
           scenario: document.getElementById('bm-scenario').value,
-          run: parseInt(document.getElementById('bm-run').value, 10)
+          run: 1
         };
         const res = await api('/api/benchmark/run', 'POST', payload);
-        state.lastBenchResults = res.results || [];
-        renderBenchmarkResults(state.lastBenchResults);
-        showToast('Benchmark selesai! CSV telah disimpan di results/');
-        await pollStatus();
+        const rows = res.results.map(r => `
+          <tr>
+            <td><strong>${r.proto.toUpperCase()}</strong></td>
+            <td>${r.mode}</td>
+            <td>${r.sent}</td>
+            <td>${r.received}</td>
+            <td>${r.lost}</td>
+            <td>${r.out_of_order}</td>
+            <td>${r.rtt_avg_ms ? r.rtt_avg_ms.toFixed(3) : '—'}</td>
+            <td>${r.throughput_bps ? r.throughput_bps.toFixed(0) : '—'}</td>
+          </tr>
+        `).join('');
+        document.getElementById('bm-tbody').innerHTML = rows;
       } catch (e) {
-        showToast(`Benchmark gagal: ${e.message}`);
+        alert('Benchmark gagal: ' + e.message);
       } finally {
         btn.disabled = false;
         btn.textContent = '▶ Jalankan Benchmark';
       }
     }
 
-    function renderBenchmarkResults(results) {
-      const tbody = document.getElementById('bm-results-tbody');
-      if (!results || results.length === 0) return;
-
-      const tcpRes = results.find(r => r.proto === 'tcp');
-      const udpRes = results.find(r => r.proto === 'udp');
-
-      if (tcpRes) {
-        document.getElementById('m-tcp-rtt').textContent = tcpRes.mode === 'ping' ? `${tcpRes.rtt_avg_ms.toFixed(3)} ms` : 'N/A (MSG)';
-        document.getElementById('m-tcp-tp').textContent = `${(tcpRes.throughput_bps / 1024).toFixed(1)} KB/s`;
-      }
-      if (udpRes) {
-        document.getElementById('m-udp-rtt').textContent = udpRes.mode === 'ping' ? `${udpRes.rtt_avg_ms.toFixed(3)} ms` : 'N/A (MSG)';
-        document.getElementById('m-udp-tp').textContent = `${(udpRes.throughput_bps / 1024).toFixed(1)} KB/s`;
-      }
-
-      tbody.innerHTML = results.map(r => `
-        <tr>
-          <td><span class="badge badge-${r.proto}">${r.proto.toUpperCase()}</span></td>
-          <td>${r.mode.toUpperCase()}</td>
-          <td>${r.sent}</td>
-          <td>${r.received}</td>
-          <td>${r.lost}</td>
-          <td>${r.out_of_order}</td>
-          <td>${r.rtt_avg_ms.toFixed(3)}</td>
-          <td>${r.rtt_stddev_ms.toFixed(3)}</td>
-          <td>${r.throughput_bps.toFixed(1)}</td>
-        </tr>
-      `).join('');
-
-      drawChart(results);
-    }
-
-    function drawChart(results) {
-      const canvas = document.getElementById('rttChart');
-      const ctx = canvas.getContext('2d');
-      const W = canvas.width;
-      const H = canvas.height;
-      ctx.clearRect(0, 0, W, H);
-
-      const padL = 50, padR = 20, padT = 20, padB = 30;
-      const plotW = W - padL - padR;
-      const plotH = H - padT - padB;
-
-      let allValues = [];
-      results.forEach(r => {
-        (r.series || []).forEach(pt => {
-          if (pt.rtt_ms !== null) allValues.push(pt.rtt_ms);
-        });
-      });
-      const maxY = allValues.length > 0 ? Math.max(...allValues) * 1.15 : 1.0;
-
-      // Grid lines
-      ctx.strokeStyle = '#1e293b';
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '11px Consolas, monospace';
-      for (let i = 0; i <= 4; i++) {
-        const y = padT + (plotH * i) / 4;
-        ctx.beginPath();
-        ctx.moveTo(padL, y);
-        ctx.lineTo(W - padR, y);
-        ctx.stroke();
-        const val = (maxY * (4 - i) / 4).toFixed(2);
-        ctx.fillText(`${val}ms`, 4, y + 4);
-      }
-
-      results.forEach(r => {
-        const pts = (r.series || []).filter(p => p.rtt_ms !== null);
-        if (pts.length === 0) return;
-        ctx.strokeStyle = r.proto === 'tcp' ? '#3b82f6' : '#10b981';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        pts.forEach((pt, idx) => {
-          const x = padL + (idx / Math.max(1, pts.length - 1)) * plotW;
-          const y = padT + plotH - (pt.rtt_ms / maxY) * plotH;
-          if (idx === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        });
-        ctx.stroke();
-      });
-    }
-
     async function runFramingSim() {
       const text = document.getElementById('sim-text').value;
       const splitAt = parseInt(document.getElementById('sim-split').value, 10);
       try {
-        const d = await api('/api/framing/simulate', 'POST', { text, split_at: splitAt });
-        document.getElementById('sim-output').innerHTML = `
-<div><strong>1. Payload JSON Application Layer (${d.json_utf8_len} byte):</strong></div>
-<div style="color:#93c5fd; margin-bottom:10px;">${escapeHtml(d.udp.wire_repr)}</div>
-
-<div><strong>2. TCP (SOCK_STREAM) Wire Format (${d.tcp.wire_bytes_len} byte, diakhiri '\\n'):</strong></div>
-<div style="color:#60a5fa;">Chunk #1 (recv pertama): "${escapeHtml(d.tcp.chunk_1_repr)}" -> Pesan utuh keluar dari StreamFramer: <strong>${d.tcp.frames_after_chunk_1}</strong> (disimpan di buffer)</div>
-<div style="color:#60a5fa; margin-bottom:10px;">Chunk #2 (recv kedua)  : "${escapeHtml(d.tcp.chunk_2_repr)}" -> Pesan utuh keluar dari StreamFramer: <strong>${d.tcp.frames_after_chunk_2}</strong> (Reassembled OK: <strong>${d.tcp.reassembled_ok}</strong>)</div>
-
-<div><strong>3. UDP (SOCK_DGRAM) Wire Format (${d.udp.wire_bytes_len} byte, tanpa '\\n'):</strong></div>
-<div style="color:#34d399;">Datagram Tunggal (recvfrom 65535): "${escapeHtml(d.udp.wire_repr)}" (Header UDP = 8 byte vs TCP = 20 byte)</div>
-        `.trim();
+        const res = await api('/api/framing/simulate', 'POST', { text, split_at: splitAt });
+        document.getElementById('sim-output').textContent = JSON.stringify(res, null, 2);
       } catch (e) {
-        console.error(e);
+        document.getElementById('sim-output').textContent = 'Error: ' + e.message;
       }
     }
 
     async function refreshServerLogs() {
       try {
+        const dTcp = await api('/api/csv/read?file=server_tcp.csv&limit=20');
+        const dUdp = await api('/api/csv/read?file=server_udp.csv&limit=20');
+        const all = [];
+        (dTcp.rows || []).forEach(r => all.push({ proto: 'tcp', row: r }));
+        (dUdp.rows || []).forEach(r => all.push({ proto: 'udp', row: r }));
+        all.sort((a, b) => parseFloat(b.row[0] || 0) - parseFloat(a.row[0] || 0));
+
         const tbody = document.getElementById('server-log-tbody');
-        let combined = [];
-        for (const f of ['server_tcp.csv', 'server_udp.csv']) {
-          try {
-            const d = await api(`/api/csv/read?file=${encodeURIComponent(f)}&limit=30`);
-            d.rows.forEach(r => combined.push(r));
-          } catch (_) {}
-        }
-        combined.sort((a, b) => parseFloat(b[0] || 0) - parseFloat(a[0] || 0));
-        tbody.innerHTML = combined.slice(0, 40).map(r => `
+        tbody.innerHTML = all.slice(0, 30).map(x => `
           <tr>
-            <td><span class="badge badge-${r[1]}">${(r[1] || '').toUpperCase()}</span></td>
-            <td>${r[2] || ''}</td>
-            <td>${r[3] || ''}</td>
-            <td>${r[4] || ''}</td>
-            <td>${escapeHtml(r[5] || '')}</td>
-            <td>${r[6] || ''}</td>
-            <td>${escapeHtml(r[7] || '')}</td>
+            <td><strong style="color:${x.proto==='tcp'?'#10B981':'#F59E0B'}">${x.proto.toUpperCase()}</strong></td>
+            <td>${escapeHtml(x.row[2]||'')}</td>
+            <td>${escapeHtml(x.row[3]||'')}</td>
+            <td>${escapeHtml(x.row[4]||'')}</td>
+            <td>${escapeHtml(x.row[5]||'')}</td>
+            <td>${escapeHtml(x.row[6]||'')}</td>
           </tr>
         `).join('');
-      } catch (e) {
-        console.error(e);
-      }
+      } catch (_) {}
+    }
+
+    async function pollStatus() {
+      try {
+        const data = await api('/api/status');
+        renderCsvFileList(data.csv_files || []);
+      } catch (_) {}
     }
 
     function renderCsvFileList(files) {
-      const container = document.getElementById('csv-file-list');
-      if (files.length === 0) {
-        container.innerHTML = `<div style="color:var(--text-muted); font-size:12px;">Belum ada file CSV.</div>`;
+      const el = document.getElementById('csv-file-list');
+      if (!files.length) {
+        el.innerHTML = '<span style="color:var(--text-dim); font-size:12px;">Belum ada CSV di results/.</span>';
         return;
       }
-      container.innerHTML = files.map(f => `
-        <div class="client-chip" style="justify-content:space-between;" onclick="previewCsv('${f.name}')">
-          <span>📄 ${f.name}</span>
-          <span style="color:var(--text-muted)">${f.size_bytes} B</span>
+      el.innerHTML = files.map(f => `
+        <div style="background:var(--bg-card); padding:8px 12px; border-radius:6px; cursor:pointer; font-size:12px; display:flex; justify-content:space-between;" onclick="previewCsv('${f.name}')">
+          <span style="color:var(--cyan-accent);">${f.name}</span>
+          <span style="color:var(--text-dim);">${f.size_bytes} B</span>
         </div>
       `).join('');
     }
 
-    async function previewCsv(filename) {
+    async function previewCsv(name) {
       try {
-        const d = await api(`/api/csv/read?file=${encodeURIComponent(filename)}&limit=100`);
-        document.getElementById('csv-preview-title').textContent = `${d.filename} (${d.total_rows} baris)`;
+        const d = await api(`/api/csv/read?file=${encodeURIComponent(name)}&limit=80`);
+        document.getElementById('csv-preview-title').textContent = d.filename;
         const dl = document.getElementById('csv-download-link');
-        dl.href = `/api/csv/download?file=${encodeURIComponent(filename)}`;
-        dl.style.display = 'inline-flex';
+        dl.href = `/api/csv/download?file=${encodeURIComponent(name)}`;
+        dl.style.display = 'inline-block';
 
         const table = document.getElementById('csv-preview-table');
         table.querySelector('thead').innerHTML = `<tr>${d.headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr>`;
@@ -1723,9 +2024,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <tr>${r.map(c => `<td>${escapeHtml(c)}</td>`).join('')}</tr>
         `).join('');
       } catch (e) {
-        showToast(e.message);
+        alert(e.message);
       }
     }
+
+    function openModal() { document.getElementById('info-modal').style.display = 'flex'; }
+    function closeModal() { document.getElementById('info-modal').style.display = 'none'; }
 
     function escapeHtml(str) {
       return String(str)
@@ -1734,18 +2038,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
     }
-
-    setInterval(pollStatus, 1200);
-    pollStatus();
   </script>
 </body>
 </html>
 """
 
-
-# =====================================================================
-# HTTP REQUEST HANDLER UNTUK WEB UI & REST API
-# =====================================================================
 
 class DualChatHttpHandler(BaseHTTPRequestHandler):
     """Handler HTTP untuk menyajikan halaman Web UI dan endpoint JSON API."""
@@ -1829,7 +2126,14 @@ class DualChatHttpHandler(BaseHTTPRequestHandler):
         if path == "/api/clients/join":
             proto = str(payload.get("proto", "tcp"))
             user = str(payload.get("user", ""))
-            ok, result = self.controller.create_client(proto=proto, user=user)
+            host = payload.get("host")
+            port = payload.get("port")
+            if port is not None:
+                try:
+                    port = int(port)
+                except ValueError:
+                    port = None
+            ok, result = self.controller.create_client(proto=proto, user=user, host=host, port=port)
             if not ok:
                 self._send_json({"error": result}, status=HTTPStatus.BAD_REQUEST)
             else:
