@@ -55,3 +55,10 @@ __pycache__/
 !*.env.example
 **/ephemeral/
 
+# Test outputs, captures, & logs
+results/
+*.pcap
+*.pcapng
+*.log
+
+
