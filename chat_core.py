@@ -422,6 +422,25 @@ class ChatServerEngine:
             if msg_type == "JOIN":
                 existing_peer = self._user_to_peer.get(user)
                 if existing_peer is not None and existing_peer != peer:
+                    # Pada UDP (connectionless), jika peer lama dari host yang sama sudah pasif > 1.5s,
+                    # anggap client melakukan reconnect dengan ephemeral port baru.
+                    is_udp_reconnect = (
+                        self.proto_label == "udp"
+                        and getattr(existing_peer, "host", None) == getattr(peer, "host", None)
+                        and (now - self._peer_last_seen.get(existing_peer, 0) > 1.5)
+                    )
+                    if is_udp_reconnect:
+                        self.logger.info(
+                            "[%s] User '%s' reconnect dari %s (menggantikan peer lama %s)",
+                            self.proto_label.upper(),
+                            user,
+                            peer,
+                        )
+                        self._peer_to_user.pop(existing_peer, None)
+                        self._peer_last_seen.pop(existing_peer, None)
+                        existing_peer = None
+
+                if existing_peer is not None and existing_peer != peer:
                     # Username sudah dipakai oleh peer lain
                     err_msg = make_message(
                         msg_type="ERR",

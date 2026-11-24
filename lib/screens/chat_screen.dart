@@ -8,6 +8,7 @@ import '../models/chat_message.dart';
 import '../models/chat_room.dart';
 import '../models/user_profile.dart';
 import '../services/dualchat_client.dart';
+import '../services/encryption_service.dart';
 import '../widgets/image_preview_dialog.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -172,18 +173,31 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     widget.room.addMessage(msg);
     widget.onMessageSent(msg);
 
-    // Wire protocol routing: Direct Message vs Group Message
+    // Wire protocol routing: Direct Message vs Group Message with E2EE AES-256
     if (!widget.room.isGroup) {
       final friendUser = widget.room.members.firstWhere(
         (m) => m.toLowerCase() != widget.profile.username.toLowerCase(),
         orElse: () => widget.room.name,
       );
-      widget.client.sendMessage('[DM:$friendUser] $rawPayload');
+      final channelId = EncryptionService.instance.getDirectChannelId(
+        widget.profile.username,
+        friendUser,
+      );
+      final encryptedPayload = EncryptionService.instance.encryptPayload(
+        rawPayload,
+        channelId: channelId,
+      );
+      widget.client.sendMessage('[DM:$friendUser] $encryptedPayload');
     } else {
+      final channelId = EncryptionService.instance.getGroupChannelId(widget.room.name);
+      final encryptedPayload = EncryptionService.instance.encryptPayload(
+        rawPayload,
+        channelId: channelId,
+      );
       if (widget.room.id == 'group_general') {
-        widget.client.sendMessage(rawPayload);
+        widget.client.sendMessage(encryptedPayload);
       } else {
-        widget.client.sendMessage('[GROUP:${widget.room.name}] $rawPayload');
+        widget.client.sendMessage('[GROUP:${widget.room.name}] $encryptedPayload');
       }
     }
 
@@ -1103,6 +1117,30 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                           ? const Color(0xFF059669)
                           : const Color(0xFFDC2626),
                     ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF6366F1).withAlpha(25),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF6366F1).withAlpha(60), width: 0.8),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.shield_outlined, size: 10, color: Color(0xFF4F46E5)),
+                      SizedBox(width: 3),
+                      Text(
+                        'E2EE AES-256',
+                        style: TextStyle(
+                          fontSize: 9,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF4F46E5),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],

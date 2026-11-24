@@ -58,7 +58,7 @@ class DualChatClient {
     int? udpPort,
     required String username,
   }) async {
-    await disconnect(sendLeave: false);
+    await disconnect(sendLeave: true);
 
     this.proto = proto;
     final targetPort = port ??
@@ -177,11 +177,11 @@ class DualChatClient {
         );
         _sendUdpRaw(joinMsg.toWireJson());
 
-        // UDP rule: timeout 2 detik jika tidak ada balasan ACK_JOIN
-        joinTimer = Timer(const Duration(milliseconds: 2000), () {
+        // UDP rule: timeout 3.5 detik jika tidak ada balasan ACK_JOIN
+        joinTimer = Timer(const Duration(milliseconds: 3500), () {
           if (!joinCompleter.isCompleted) {
             _emitSystemMessage(
-              'JOIN gagal/hilang (UDP timeout 2s — sifat connectionless & unacknowledged)',
+              'JOIN gagal/hilang (UDP timeout 3.5s — sifat connectionless & unacknowledged)',
               isError: true,
             );
             joinCompleter.complete(false);
@@ -399,7 +399,7 @@ class DualChatClient {
   }
 
   Future<void> disconnect({bool sendLeave = true}) async {
-    if (sendLeave && status == ConnectionStatus.connected) {
+    if (sendLeave && (status == ConnectionStatus.connected || _udpSocket != null || _tcpSocket != null)) {
       final leaveMsg = ChatMessage(
         type: MessageType.leave,
         seq: _nextSeq(),
@@ -409,6 +409,8 @@ class DualChatClient {
         isSelf: true,
       );
       _sendPacket(leaveMsg);
+      // Tunggu sejenak agar OS sempat mem-flush datagram UDP sebelum socket di-close
+      await Future.delayed(const Duration(milliseconds: 30));
     }
 
     _setStatus(ConnectionStatus.disconnected);

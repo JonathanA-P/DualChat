@@ -8,6 +8,7 @@ import 'screens/profile_screen.dart';
 import 'services/chat_storage_service.dart';
 import 'services/dualchat_client.dart';
 import 'services/profile_service.dart';
+import 'services/encryption_service.dart';
 import 'widgets/action_dialogs.dart';
 import 'widgets/create_profile_dialog.dart';
 import 'widgets/floating_menu.dart';
@@ -211,7 +212,15 @@ class _DualChatHomeScreenState extends State<DualChatHomeScreen>
       final dmMatch = RegExp(r'^\[DM:([^\]]+)\]\s*(.*)$').firstMatch(msg.data);
       if (dmMatch != null) {
         final toUser = dmMatch.group(1)?.trim().toLowerCase() ?? '';
-        cleanText = dmMatch.group(2) ?? '';
+        final rawContent = dmMatch.group(2) ?? '';
+        final channelId = EncryptionService.instance.getDirectChannelId(
+          msg.user,
+          _profile!.username,
+        );
+        cleanText = EncryptionService.instance.decryptPayload(
+          rawContent,
+          channelId: channelId,
+        );
 
         if (toUser == _profile!.username.toLowerCase()) {
           // Addressed to me from msg.user
@@ -249,7 +258,12 @@ class _DualChatHomeScreenState extends State<DualChatHomeScreen>
       final groupMatch = RegExp(r'^\[GROUP:([^\]]+)\]\s*(.*)$').firstMatch(msg.data);
       if (groupMatch != null) {
         final groupName = groupMatch.group(1)?.trim() ?? '';
-        cleanText = groupMatch.group(2) ?? '';
+        final rawContent = groupMatch.group(2) ?? '';
+        final channelId = EncryptionService.instance.getGroupChannelId(groupName);
+        cleanText = EncryptionService.instance.decryptPayload(
+          rawContent,
+          channelId: channelId,
+        );
 
         if (groupName.isNotEmpty) {
           _discoveredNetworkGroups.add(groupName);
@@ -560,7 +574,12 @@ class _DualChatHomeScreenState extends State<DualChatHomeScreen>
     ChatStorageService.instance.saveRooms(_rooms);
 
     if (_profile != null) {
-      _client.sendMessage('[GROUP:$cleanName] [SISTEM] ${_profile!.username} membuat grup baru!');
+      final channelId = EncryptionService.instance.getGroupChannelId(cleanName);
+      final encPayload = EncryptionService.instance.encryptPayload(
+        '[SISTEM] ${_profile!.username} membuat grup baru!',
+        channelId: channelId,
+      );
+      _client.sendMessage('[GROUP:$cleanName] $encPayload');
     }
 
     _tabController.animateTo(0);
@@ -600,7 +619,12 @@ class _DualChatHomeScreenState extends State<DualChatHomeScreen>
     }
 
     if (_profile != null) {
-      _client.sendMessage('[GROUP:$cleanName] [SISTEM] ${_profile!.username} bergabung ke grup!');
+      final channelId = EncryptionService.instance.getGroupChannelId(cleanName);
+      final encPayload = EncryptionService.instance.encryptPayload(
+        '[SISTEM] ${_profile!.username} bergabung ke grup!',
+        channelId: channelId,
+      );
+      _client.sendMessage('[GROUP:$cleanName] $encPayload');
     }
 
     _tabController.animateTo(0);
